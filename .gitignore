@@ -1,0 +1,12 @@
+# Go
+/sonar-remote.exe
+*.exe
+
+# Node / Vite
+web/node_modules/
+web/dist/
+*.log
+
+# OS
+Thumbs.db
+.DS_Store

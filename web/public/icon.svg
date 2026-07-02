@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a2436"/>
+      <stop offset="1" stop-color="#0a0e15"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.18" r="0.75">
+      <stop offset="0" stop-color="#2f4c8a" stop-opacity="0.65"/>
+      <stop offset="1" stop-color="#2f4c8a" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="b1" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#3f6fe6"/><stop offset="1" stop-color="#6f9bff"/>
+    </linearGradient>
+    <linearGradient id="b2" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#7c5cf0"/><stop offset="1" stop-color="#b49bff"/>
+    </linearGradient>
+    <linearGradient id="b3" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#e0559b"/><stop offset="1" stop-color="#ff8ac2"/>
+    </linearGradient>
+    <filter id="sh" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <rect width="512" height="512" fill="url(#glow)"/>
+
+  <!-- three faders: track, colored fill up to the handle, white handle -->
+  <!-- bar 1 (x=108) -->
+  <rect x="108" y="140" width="68" height="232" rx="34" fill="#ffffff" opacity="0.08"/>
+  <rect x="108" y="206" width="68" height="166" rx="34" fill="url(#b1)"/>
+  <rect x="98" y="188" width="88" height="40" rx="13" fill="#eef2f8" filter="url(#sh)"/>
+  <rect x="130" y="206" width="24" height="4" rx="2" fill="#6f9bff"/>
+
+  <!-- bar 2 (x=222) -->
+  <rect x="222" y="140" width="68" height="232" rx="34" fill="#ffffff" opacity="0.08"/>
+  <rect x="222" y="264" width="68" height="108" rx="34" fill="url(#b2)"/>
+  <rect x="212" y="246" width="88" height="40" rx="13" fill="#eef2f8" filter="url(#sh)"/>
+  <rect x="244" y="264" width="24" height="4" rx="2" fill="#b49bff"/>
+
+  <!-- bar 3 (x=336) -->
+  <rect x="336" y="140" width="68" height="232" rx="34" fill="#ffffff" opacity="0.08"/>
+  <rect x="336" y="182" width="68" height="190" rx="34" fill="url(#b3)"/>
+  <rect x="326" y="164" width="88" height="40" rx="13" fill="#eef2f8" filter="url(#sh)"/>
+  <rect x="358" y="182" width="24" height="4" rx="2" fill="#ff8ac2"/>
+</svg>
