@@ -197,6 +197,25 @@ export async function fetchSnapshot(): Promise<Snapshot> {
   };
 }
 
+/** Minimal snapshot for the compact tray flyout: just faders + chatmix + status.
+ * Three requests instead of fetchSnapshot's seven — the flyout has no device
+ * pickers or app routing, so polling those every tick would be wasted work. */
+export interface Levels {
+  online: boolean;
+  mode: string;
+  volumes: ClassicVolumes | null;
+  chatMix: ChatMix | null;
+}
+
+export async function fetchLevels(): Promise<Levels> {
+  const [mode, volumes, chatMix] = await Promise.all([
+    getJSON<string>("/mode").catch(() => "classic"),
+    getJSON<ClassicVolumes>("/volumeSettings/classic"),
+    getJSON<ChatMix>("/chatMix").catch(() => null),
+  ]);
+  return { online: true, mode, volumes, chatMix };
+}
+
 /** Change the classic-mode physical output device (shared by all render channels). */
 export function setOutputDevice(deviceId: string): Promise<void> {
   return put(

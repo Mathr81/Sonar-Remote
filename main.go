@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"errors"
 	"flag"
@@ -16,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"sonar-remote/internal/desktop"
 	"sonar-remote/internal/mdnsx"
 	"sonar-remote/internal/sonar"
 )
@@ -27,6 +29,7 @@ func main() {
 	port := flag.Int("port", 80, "HTTP port to listen on (80 = bare http://<host>.local)")
 	host := flag.String("host", "sonar", "mDNS hostname (published as <host>.local)")
 	noMDNS := flag.Bool("no-mdns", false, "disable mDNS advertising")
+	noTray := flag.Bool("no-tray", false, "disable the Windows tray icon + flyout (headless server only)")
 	flag.Parse()
 
 	// Windows' MIME registry is unreliable; pin the types we serve.
@@ -71,10 +74,30 @@ func main() {
 		}
 	}()
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	<-sig
-	log.Println("shutting down…")
+	shutdown := func() {
+		log.Println("shutting down…")
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}
+
+	if *noTray {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		shutdown()
+		return
+	}
+
+	// Windows: run the tray icon + flyout (blocks until the user quits).
+	// Elsewhere: desktop.Run just waits for a signal.
+	if err := desktop.Run(*host, *port, shutdown); err != nil {
+		log.Printf("tray unavailable (%v); falling back to headless server", err)
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		shutdown()
+	}
 }
 
 // spaHandler serves the embedded Svelte build, falling back to index.html.
