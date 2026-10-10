@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,17 +20,20 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+	"rsc.io/qr"
 
+	"sonar-remote/internal/mdnsx"
 	"sonar-remote/internal/sonar"
 )
 
 const (
-	wmTray  = wmApp + 1 // tray icon callback
-	wmState = wmApp + 2 // posted by the poller when Sonar's state changed
+	wmTray    = wmApp + 1 // tray icon callback
+	wmState   = wmApp + 2 // posted by the poller when Sonar's state changed
+	wmConnect = wmApp + 3 // posted by the tray menu: open the connect panel
 
 	hotkeyID = 1
 
-	idRemote, idAutostart, idQuit = 1, 2, 3
+	idConnect, idRemote, idAutostart, idQuit = 1, 2, 3, 4
 
 	className    = "SonarRemoteFlyout"
 	runKey       = `Software\Microsoft\Windows\CurrentVersion\Run`
@@ -39,9 +44,10 @@ const (
 var ErrAlreadyRunning = errors.New("sonar-remote is already running")
 
 type app struct {
-	hwnd      uintptr
-	sonar     *sonar.Client
-	remoteURL string
+	hwnd  uintptr
+	sonar *sonar.Client
+	host  string // mDNS name of the web remote, "" if not published
+	port  int
 
 	// UI thread only.
 	scale            float64 // DPI / 96
@@ -60,6 +66,9 @@ type app struct {
 	drag, focus      int
 	kbd, tracking    bool
 	hiddenAt         time.Time
+	connect          bool     // showing the "connect a device" panel instead of the mixer
+	link             string   // LAN address of the web remote, encoded in code
+	code             *qr.Code // nil while the machine has no LAN address
 	icon             uintptr
 	iconKey          string
 
@@ -78,7 +87,7 @@ var a *app // the single instance; wndProc reaches it through this
 
 // Run shows the tray icon and blocks on the message loop until the user quits.
 // It must be called from the main goroutine.
-func Run(client *sonar.Client, remoteURL string) error {
+func Run(client *sonar.Client, host string, port int) error {
 	runtime.LockOSThread()
 
 	if _, err := windows.CreateMutex(nil, false, windows.StringToUTF16Ptr(`Local\SonarRemote`)); err == windows.ERROR_ALREADY_EXISTS {
@@ -88,7 +97,7 @@ func Run(client *sonar.Client, remoteURL string) error {
 	gdipStart()
 
 	a = &app{
-		sonar: client, remoteURL: remoteURL,
+		sonar: client, host: host, port: port,
 		hover: -1, drag: -1, focus: -1,
 		pend: map[string]func() error{},
 		kick: make(chan struct{}, 1), wake: make(chan struct{}, 1),
@@ -163,7 +172,7 @@ func wndProc(hwnd, message, wParam, lParam uintptr) uintptr {
 			// Clicking the icon while the flyout is open first deactivates
 			// (hides) it; don't reopen it on the same click.
 			if time.Since(a.hiddenAt) > 300*time.Millisecond {
-				a.show()
+				a.show(false)
 			}
 		case wmContextMenu:
 			a.showMenu()
@@ -172,7 +181,7 @@ func wndProc(hwnd, message, wParam, lParam uintptr) uintptr {
 		if a.visible.Load() {
 			a.hide()
 		} else {
-			a.show()
+			a.show(false)
 		}
 	case wmActivate:
 		if wParam&0xFFFF == 0 { // WA_INACTIVE: dismiss like a system flyout
@@ -180,6 +189,8 @@ func wndProc(hwnd, message, wParam, lParam uintptr) uintptr {
 		}
 	case wmState:
 		a.stateChanged()
+	case wmConnect:
+		a.show(true)
 	case wmPaint:
 		a.onPaint()
 	case wmEraseBkgnd:
@@ -214,7 +225,23 @@ func wndProc(hwnd, message, wParam, lParam uintptr) uintptr {
 
 // ── Flyout window ───────────────────────────────────────────────────────────
 
-func (a *app) show() {
+// url returns the web remote's address on the given host.
+func (a *app) url(host string) string {
+	if a.port == 80 {
+		return "http://" + host
+	}
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(a.port))
+}
+
+// show opens the flyout on the mixer, or on the panel that tells another
+// device how to reach the web remote.
+func (a *app) show(connect bool) {
+	a.connect, a.code = connect, nil
+	if ip := mdnsx.LANAddr(); connect && ip != "" {
+		// The IP rather than the .local name: it works even where mDNS doesn't.
+		a.link = a.url(ip)
+		a.code, _ = qr.Encode(a.link, qr.M)
+	}
 	dpi, _, _ := pGetDpiForWindow.Call(a.hwnd)
 	if s := float64(dpi) / 96; s != a.scale {
 		a.scale = s
@@ -456,7 +483,8 @@ func (a *app) showMenu() {
 	if autostart() {
 		auto |= mfChecked
 	}
-	add(mfString, idRemote, "Ouvrir la télécommande web")
+	add(mfString, idConnect, "Connecter un iPad ou un téléphone")
+	add(mfString, idRemote, "Ouvrir la télécommande web ici")
 	add(auto, idAutostart, "Lancer au démarrage de Windows")
 	add(mfSeparator, 0, "")
 	add(mfString, idQuit, "Quitter")
@@ -468,9 +496,13 @@ func (a *app) showMenu() {
 	cmd, _, _ := pTrackPopupMenu.Call(menu, tpmRightButton|tpmReturnCmd|tpmBottomAlign|tpmRightAlign,
 		uintptr(pt.X), uintptr(pt.Y), 0, a.hwnd, 0)
 	switch cmd {
+	case idConnect:
+		// Posted, not called: the menu closing still has activation changes
+		// queued, and they would dismiss a flyout shown right now.
+		pPostMessageW.Call(a.hwnd, wmConnect, 0, 0)
 	case idRemote:
 		pShellExecuteW.Call(0, uintptr(unsafe.Pointer(windows.StringToUTF16Ptr("open"))),
-			uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(a.remoteURL))), 0, 0, 1)
+			uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(a.url("localhost")))), 0, 0, 1)
 	case idAutostart:
 		setAutostart(auto&mfChecked == 0)
 	case idQuit:

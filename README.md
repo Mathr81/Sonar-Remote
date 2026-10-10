@@ -19,7 +19,8 @@ s'annonce sur le réseau sous `sonar.local`.
   l'icône d'un canal pour le couper. Master, Jeu, Chat, Média, Aux, Micro et ChatMix.
 - **Clavier** : ↑ ↓ pour changer de ligne, ← → pour régler, Espace ou M pour couper.
 - **Icône** : cinq barres qui suivent le volume Master, barrées quand il est coupé.
-- **Clic droit** : ouvrir la télécommande web, lancer au démarrage de Windows, quitter.
+- **Clic droit** : connecter un iPad ou un téléphone, ouvrir la télécommande web,
+  lancer au démarrage de Windows, quitter.
 
 Le mixer est une fenêtre Win32 native dessinée en GDI+ : il s'ouvre en un
 dixième de seconde, suit le thème clair/sombre et la couleur d'accentuation de
@@ -28,8 +29,10 @@ Windows, et ne lance aucun processus navigateur. Au repos, l'application occupe
 
 ## Télécommande web
 
-Sur un appareil du même réseau Wi-Fi, ouvre **http://sonar.local**. Sur iOS,
-*Partager → Sur l'écran d'accueil* en fait une app plein écran.
+Clic droit sur l'icône du tray → *Connecter un iPad ou un téléphone* : scanne le
+QR code depuis un appareil du même réseau. L'adresse est écrite dessous, et
+**http://sonar.local** marche aussi. Sur iOS, *Partager → Sur l'écran d'accueil*
+en fait une app plein écran.
 
 - Un fader par canal, avec bouton de coupure, et le ChatMix en bas.
 - Choix de la sortie audio et du micro depuis la barre du haut.

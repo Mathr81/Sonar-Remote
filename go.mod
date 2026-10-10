@@ -5,6 +5,7 @@ go 1.26.1
 require (
 	github.com/grandcat/zeroconf v1.0.0
 	golang.org/x/sys v0.46.0
+	rsc.io/qr v0.2.0
 )
 
 require (

@@ -96,6 +96,9 @@ func rowTop(i int) int {
 
 // hit returns the row and part under a client-area point (row -1 if none).
 func (a *app) hit(x, y int) (row, part int) {
+	if a.connect {
+		return -1, partNone
+	}
 	for i := 0; i <= chatRow; i++ {
 		top := a.px(rowTop(i))
 		if y < top || y >= top+a.px(rowH) {
@@ -214,6 +217,12 @@ func (a *app) onWheel(x, y, notches int) {
 }
 
 func (a *app) onKey(vk uintptr) {
+	if a.connect {
+		if vk == vkEscape {
+			a.hide()
+		}
+		return
+	}
 	if a.focus < 0 || !a.kbd { // first key press only reveals the focus ring
 		a.focus, a.kbd = max(a.focus, 0), true
 		if vk != vkEscape {
@@ -252,6 +261,10 @@ func (a *app) paint(g gfx) {
 		g.clear(t.bg)
 	}
 	w, h := a.px(winW), a.px(winH)
+	if a.connect {
+		a.paintConnect(g)
+		return
+	}
 	if !online {
 		g.text("Sonar est introuvable", a.fBold, t.text, 0, h/2-a.px(34), w, a.px(24), a.fmtCenter)
 		g.text("Lance SteelSeries GG : le mixer se reconnecte tout seul.", a.fText, t.dim,
@@ -295,6 +308,42 @@ func (a *app) paint(g gfx) {
 	g.fillRect(t.rail, a.px((railX0+railX1)/2), cy-a.px(6), max(1, a.px(1)), a.px(12))
 	a.paintSlider(g, chatRow, cy, 0.5, (st.ChatMix+1)/2, !st.HasChatMix)
 	g.text(glyphs[2], a.fIcon, t.dim, a.px(valueR-iconSz+4), top, a.px(iconSz), a.px(rowH), a.fmtCenter)
+}
+
+// paintConnect draws the QR code of the web remote's LAN address, with the
+// addresses spelled out underneath for devices that can't scan it.
+func (a *app) paintConnect(g gfx) {
+	t, w, h := a.th, a.px(winW), a.px(winH)
+	if a.code == nil {
+		g.text("Aucun réseau local", a.fBold, t.text, 0, h/2-a.px(34), w, a.px(24), a.fmtCenter)
+		g.text("Connecte ce PC au Wi-Fi ou au réseau, puis rouvre ce panneau.", a.fText, t.dim,
+			a.px(48), h/2-a.px(8), w-a.px(96), a.px(44), a.fmtCenter)
+		return
+	}
+	// Whole-pixel modules keep the code sharp; 4 modules of white margin all
+	// round is what scanners expect. Always dark on white, whatever the theme.
+	n := a.code.Size
+	box := a.px(208)
+	m := max(1, box/(n+8))
+	side := m * (n + 8)
+	x0, y0 := (w-side)/2, a.px(16)+(box-side)/2
+	g.fillRound(0xFFFFFFFF, x0, y0, side, side, a.px(8))
+	g.brush(0xFF000000, func(b uintptr) {
+		for y := 0; y < n; y++ {
+			for x := 0; x < n; x++ {
+				if a.code.Black(x, y) {
+					pGdipFillRectangleI.Call(uintptr(g), b, uintptr(x0+(x+4)*m), uintptr(y0+(y+4)*m), uintptr(m), uintptr(m))
+				}
+			}
+		}
+	})
+	y := a.px(16) + box + a.px(8)
+	g.text(a.link, a.fBold, t.text, 0, y, w, a.px(24), a.fmtCenter)
+	hint := "Scanne ce code depuis le même réseau."
+	if a.host != "" {
+		hint = "ou " + a.url(a.host+".local") + "\n" + hint
+	}
+	g.text(hint, a.fText, t.dim, a.px(24), y+a.px(26), w-a.px(48), a.px(60), a.fmtCenter)
 }
 
 func (a *app) paintFocus(g gfx, i int) {

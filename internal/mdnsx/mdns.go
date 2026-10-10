@@ -30,13 +30,12 @@ func Advertise(host string, port int) (stop func()) {
 		tick := time.NewTicker(10 * time.Second)
 		defer tick.Stop()
 		for {
-			ip, iface := primaryInterface()
-			if addr := ip.String(); ip != nil && addr != current {
+			if addr := LANAddr(); addr != "" && addr != current {
 				if stopCurrent != nil {
 					stopCurrent()
 				}
 				current, stopCurrent = "", nil
-				if s, method, err := register(host, port, addr, iface); err != nil {
+				if s, method, err := register(host, port, addr, interfaceOf(addr)); err != nil {
 					log.Printf("mDNS: %v", err)
 				} else {
 					current, stopCurrent = addr, s
@@ -110,26 +109,31 @@ func viaBonjour(host string, port int, ip string) (func(), error) {
 	return func() { _ = cmd.Process.Kill() }, nil
 }
 
-// primaryInterface returns the IPv4 address (and its interface) on the default
-// route, or nil while the machine has no network.
-func primaryInterface() (net.IP, *net.Interface) {
-	conn, err := net.Dial("udp", "8.8.8.8:80") // no packets sent; picks source IP
+// LANAddr returns the IPv4 address on the default route, "" while the machine
+// has no network. It is cheap: the routing table answers, nothing is sent.
+func LANAddr() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
-		return nil, nil
+		return ""
 	}
 	defer conn.Close()
-	ip := conn.LocalAddr().(*net.UDPAddr).IP.To4()
-	if ip == nil {
-		return nil, nil
+	if ip := conn.LocalAddr().(*net.UDPAddr).IP.To4(); ip != nil {
+		return ip.String()
 	}
+	return ""
+}
+
+// interfaceOf returns the interface holding addr. Enumerating adapters is slow
+// on Windows (about a second with a few virtual ones), so call it sparingly.
+func interfaceOf(addr string) *net.Interface {
 	ifaces, _ := net.Interfaces()
 	for i := range ifaces {
 		addrs, _ := ifaces[i].Addrs()
 		for _, a := range addrs {
-			if n, ok := a.(*net.IPNet); ok && n.IP.Equal(ip) {
-				return ip, &ifaces[i]
+			if n, ok := a.(*net.IPNet); ok && n.IP.String() == addr {
+				return &ifaces[i]
 			}
 		}
 	}
-	return ip, nil
+	return nil
 }

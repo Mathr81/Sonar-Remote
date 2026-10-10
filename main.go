@@ -79,11 +79,11 @@ func main() {
 		signal.Notify(sig, os.Interrupt)
 		<-sig
 	} else {
-		url := "http://localhost"
-		if *port != 80 {
-			url += ":" + strconv.Itoa(*port)
+		name := *host
+		if *noMDNS {
+			name = "" // not published, so not worth showing
 		}
-		if err := desktop.Run(client, url); err != nil {
+		if err := desktop.Run(client, name, *port); err != nil {
 			log.Fatal(err)
 		}
 		log.Print("tray closed, exiting")
