@@ -1,54 +1,38 @@
+/* A mixing desk: graphite panel, recessed fader slots, one amber signal colour.
+   Mute is the only other hue, as on a hardware console. */
 :root {
-  --bg: #0d1117;
-  --bg-2: #11161f;
-  --text: #e6e9ef;
-  --text-dim: #8b95a5;
+  --desk: #1b1d21;
+  --well: #0f1012;
+  --raise: #2b2e34;
+  --line: #2f3238;
+  --ink: #f2f3f5;
+  --dim: #979ca7;
+  --signal: #f2a93b;
+  --mute: #d9453f;
 
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter,
-    system-ui, sans-serif;
+  /* SF Pro Rounded on iPad/iPhone/Mac, the platform face elsewhere: no font to ship. */
+  font-family: ui-rounded, "SF Pro Rounded", system-ui, "Segoe UI Variable Text", "Segoe UI",
+    sans-serif;
   color-scheme: dark;
 }
 
 * {
   box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
 }
 
 html,
 body {
   margin: 0;
   height: 100%;
-  background: var(--bg);
-  color: var(--text);
+  background: var(--desk);
+  color: var(--ink);
   -webkit-user-select: none;
   user-select: none;
   overscroll-behavior: none;
 }
 
-#app {
-  height: 100dvh;
-  background: radial-gradient(
-      1200px 600px at 50% -10%,
-      #161d2b 0%,
-      transparent 60%
-    ),
-    var(--bg);
-}
-
-button {
-  font-family: inherit;
-}
-
-/* Narrow screens (iPhone / portrait): let the board scroll horizontally
-   while each strip keeps a usable width. */
-@media (max-width: 640px) {
-  .board {
-    grid-auto-flow: column;
-    grid-auto-columns: 40vw;
-    grid-template-columns: none !important;
-    overflow-x: auto;
-    scroll-snap-type: x mandatory;
-  }
-  .board > :global(section) {
-    scroll-snap-align: start;
-  }
+button:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
 }

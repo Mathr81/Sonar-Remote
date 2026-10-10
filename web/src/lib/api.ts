@@ -72,18 +72,20 @@ export interface RoutedApp {
   channel: ClassicChannel;
 }
 
-/** Full snapshot of everything the UI renders, fetched in one poll tick. */
-export interface Snapshot {
-  online: boolean;
+/** The fast-moving part of Sonar's state, polled every second. */
+export interface Levels {
   mode: string;
-  volumes: ClassicVolumes | null;
+  volumes: ClassicVolumes;
   chatMix: ChatMix | null;
-  presets: SelectedConfig[];
-  deviceNames: Record<string, string>; // classic channel id -> friendly name
-  outputDevices: OutputDevice[]; // selectable physical render outputs
-  currentOutputId: string; // shared classic render output deviceId
-  captureDevices: OutputDevice[]; // selectable physical mic inputs
-  currentMicId: string; // classic mic input deviceId
+}
+
+/** Devices, presets and app routing: changes rarely, polled less often. */
+export interface Routing {
+  presets: Record<string, string>; // channel id -> EQ preset name
+  outputs: OutputDevice[]; // selectable physical render outputs
+  outputId: string; // output shared by every render channel
+  mics: OutputDevice[]; // selectable physical mic inputs
+  micId: string;
   apps: RoutedApp[]; // apps routed to render channels
   channelDeviceId: Partial<Record<ClassicChannel, string>>; // channel -> Sonar VAD id
 }
@@ -112,45 +114,27 @@ async function put(path: string): Promise<void> {
   if (!r.ok) throw new Error(`${path} -> ${r.status}`);
 }
 
-// classicRedirections uses short ids; map them to our channel ids.
-const REDIRECT_ID_TO_CHANNEL: Record<string, ClassicChannel> = {
-  game: "game",
-  chat: "chatRender",
-  media: "media",
-  aux: "aux",
-  mic: "chatCapture",
-};
+export async function fetchLevels(): Promise<Levels> {
+  const [mode, volumes, chatMix] = await Promise.all([
+    getJSON<string>("/mode").catch(() => "classic"),
+    getJSON<ClassicVolumes>("/volumeSettings/classic"),
+    getJSON<ChatMix>("/v1/chatMix").catch(() => null),
+  ]);
+  return { mode, volumes, chatMix };
+}
 
-export async function fetchSnapshot(): Promise<Snapshot> {
-  const [mode, volumes, chatMix, presets, redirects, devices, routing] =
-    await Promise.all([
-      getJSON<string>("/mode").catch(() => "classic"),
-      getJSON<ClassicVolumes>("/volumeSettings/classic"),
-      getJSON<ChatMix>("/chatMix").catch(() => null),
-      getJSON<SelectedConfig[]>("/configs/selected").catch(() => []),
-      getJSON<Redirection[]>("/classicRedirections").catch(() => []),
-      getJSON<AudioDevice[]>("/audioDevices").catch(() => []),
-      getJSON<DeviceRouting[]>("/AudioDeviceRouting").catch(() => []),
-    ]);
+export async function fetchRouting(): Promise<Routing> {
+  const [selected, redirects, devices, routing] = await Promise.all([
+    getJSON<SelectedConfig[]>("/configs/selected").catch(() => []),
+    getJSON<Redirection[]>("/classicRedirections").catch(() => []),
+    getJSON<AudioDevice[]>("/audioDevices").catch(() => []),
+    getJSON<DeviceRouting[]>("/AudioDeviceRouting").catch(() => []),
+  ]);
 
-  const byId = new Map(devices.map((d) => [d.id, d.friendlyName]));
-  const deviceNames: Record<string, string> = {};
-  for (const r of redirects) {
-    const ch = REDIRECT_ID_TO_CHANNEL[r.id];
-    const name = byId.get(r.deviceId);
-    if (ch && name) deviceNames[ch] = name;
-  }
-
-  const outputDevices: OutputDevice[] = devices
-    .filter((d) => d.dataFlow === "render" && !d.isVad)
-    .map((d) => ({ id: d.id, name: d.friendlyName }));
-  const currentOutputId =
-    redirects.find((r) => RENDER_REDIRECT_IDS.includes(r.id))?.deviceId ?? "";
-
-  const captureDevices: OutputDevice[] = devices
-    .filter((d) => d.dataFlow === "capture" && !d.isVad)
-    .map((d) => ({ id: d.id, name: d.friendlyName }));
-  const currentMicId = redirects.find((r) => r.id === "mic")?.deviceId ?? "";
+  const physical = (flow: string): OutputDevice[] =>
+    devices
+      .filter((d) => d.dataFlow === flow && !d.isVad)
+      .map((d) => ({ id: d.id, name: d.friendlyName }));
 
   // Sonar virtual render devices carry a role identifying their channel.
   const channelDeviceId: Partial<Record<ClassicChannel, string>> = {};
@@ -175,45 +159,16 @@ export async function fetchSnapshot(): Promise<Snapshot> {
       }
     }
   }
-  const apps: RoutedApp[] = [...best.entries()].map(([processId, v]) => ({
-    processId,
-    name: v.name,
-    channel: v.channel,
-  }));
 
   return {
-    online: true,
-    mode,
-    volumes,
-    chatMix,
-    presets,
-    deviceNames,
-    outputDevices,
-    currentOutputId,
-    captureDevices,
-    currentMicId,
-    apps,
+    presets: Object.fromEntries(selected.map((p) => [p.virtualAudioDevice, p.name])),
+    outputs: physical("render"),
+    outputId: redirects.find((r) => RENDER_REDIRECT_IDS.includes(r.id))?.deviceId ?? "",
+    mics: physical("capture"),
+    micId: redirects.find((r) => r.id === "mic")?.deviceId ?? "",
+    apps: [...best].map(([processId, v]) => ({ processId, name: v.name, channel: v.channel })),
     channelDeviceId,
   };
-}
-
-/** Minimal snapshot for the compact tray flyout: just faders + chatmix + status.
- * Three requests instead of fetchSnapshot's seven — the flyout has no device
- * pickers or app routing, so polling those every tick would be wasted work. */
-export interface Levels {
-  online: boolean;
-  mode: string;
-  volumes: ClassicVolumes | null;
-  chatMix: ChatMix | null;
-}
-
-export async function fetchLevels(): Promise<Levels> {
-  const [mode, volumes, chatMix] = await Promise.all([
-    getJSON<string>("/mode").catch(() => "classic"),
-    getJSON<ClassicVolumes>("/volumeSettings/classic"),
-    getJSON<ChatMix>("/chatMix").catch(() => null),
-  ]);
-  return { online: true, mode, volumes, chatMix };
 }
 
 /** Change the classic-mode physical output device (shared by all render channels). */
@@ -248,5 +203,5 @@ export function setMute(channel: ClassicChannel, muted: boolean): Promise<void> 
 
 export function setChatMix(balance: number): Promise<void> {
   const b = Math.min(1, Math.max(-1, balance));
-  return put(`/chatMix?balance=${b.toFixed(4)}`);
+  return put(`/v1/chatMix?balance=${b.toFixed(4)}`);
 }
