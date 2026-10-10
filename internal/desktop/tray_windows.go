@@ -1,498 +1,446 @@
-//go:build windows
-
-// Package desktop adds an EarTrumpet-style Windows tray experience on top of
-// the local server: a dynamic tray icon reflecting the Sonar master level, a
-// borderless WebView2 "flyout" hosting the compact mixer (/flyout), and a
-// global hotkey — all driven by a single Win32 message loop on the main OS
-// thread. It reuses the running HTTP server; nothing here talks to Sonar
-// directly.
+// Package desktop is the Windows tray experience: an icon showing the Sonar
+// master level, a native flyout mixer (flyout_windows.go) and a global hotkey,
+// all on one Win32 message loop. It draws everything itself, so opening the
+// flyout costs no extra process and no extra memory.
 package desktop
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
+	"log"
+	"os"
 	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
-	"github.com/jchv/go-webview2/pkg/edge"
 	"golang.org/x/sys/windows"
-)
+	"golang.org/x/sys/windows/registry"
 
-// ── Win32 plumbing ──────────────────────────────────────────────────────────
-
-var (
-	user32   = windows.NewLazySystemDLL("user32.dll")
-	gdi32    = windows.NewLazySystemDLL("gdi32.dll")
-	shell32  = windows.NewLazySystemDLL("shell32.dll")
-	dwmapi   = windows.NewLazySystemDLL("dwmapi.dll")
-	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
-
-	pRegisterClassExW     = user32.NewProc("RegisterClassExW")
-	pCreateWindowExW      = user32.NewProc("CreateWindowExW")
-	pDefWindowProcW       = user32.NewProc("DefWindowProcW")
-	pGetMessageW          = user32.NewProc("GetMessageW")
-	pTranslateMessage     = user32.NewProc("TranslateMessage")
-	pDispatchMessageW     = user32.NewProc("DispatchMessageW")
-	pPostQuitMessage      = user32.NewProc("PostQuitMessage")
-	pShowWindow           = user32.NewProc("ShowWindow")
-	pSetForegroundWindow  = user32.NewProc("SetForegroundWindow")
-	pSetWindowPos         = user32.NewProc("SetWindowPos")
-	pGetClientRect        = user32.NewProc("GetClientRect")
-	pLoadCursorW          = user32.NewProc("LoadCursorW")
-	pLoadImageW           = user32.NewProc("LoadImageW")
-	pRegisterHotKey       = user32.NewProc("RegisterHotKey")
-	pCreatePopupMenu      = user32.NewProc("CreatePopupMenu")
-	pAppendMenuW          = user32.NewProc("AppendMenuW")
-	pTrackPopupMenu       = user32.NewProc("TrackPopupMenu")
-	pDestroyMenu          = user32.NewProc("DestroyMenu")
-	pPostMessageW         = user32.NewProc("PostMessageW")
-	pSystemParametersInfo = user32.NewProc("SystemParametersInfoW")
-	pCreateIconIndirect   = user32.NewProc("CreateIconIndirect")
-	pDestroyIcon          = user32.NewProc("DestroyIcon")
-
-	pCreateDIBSection = gdi32.NewProc("CreateDIBSection")
-	pCreateBitmap     = gdi32.NewProc("CreateBitmap")
-	pDeleteObject     = gdi32.NewProc("DeleteObject")
-	pCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
-
-	pShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
-	pShellExecuteW    = shell32.NewProc("ShellExecuteW")
-
-	pDwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute")
-	pGetModuleHandleW      = kernel32.NewProc("GetModuleHandleW")
+	"sonar-remote/internal/sonar"
 )
 
 const (
-	wmDestroy     = 0x0002
-	wmSize        = 0x0005
-	wmActivate    = 0x0006
-	wmCommand     = 0x0111
-	wmHotkey      = 0x0312
-	wmContextMenu = 0x007B
-	wmLButtonUp   = 0x0202
-	wmRButtonUp   = 0x0205
-	wmApp         = 0x8000
-	wmUser        = 0x0400
-
-	wmTray           = wmApp + 1 // tray icon callback
-	wmUpdateIcon     = wmApp + 2 // posted by the poller (wParam=vol%, lParam=muted)
-	wmDestroyWebview = wmApp + 3 // posted by the idle timer (wParam=generation)
-
-	ninSelect    = wmUser + 0
-	ninKeySelect = wmUser + 1
-
-	waInactive = 0
-
-	swHide = 0
-	swShow = 5
-
-	csDropShadow = 0x00020000
-	csHRedraw    = 0x0002
-	csVRedraw    = 0x0001
-
-	wsPopup        = 0x80000000
-	wsExToolWindow = 0x00000080
-	wsExTopmost    = 0x00000008
-
-	swpNoSize     = 0x0001
-	swpNoActivate = 0x0010
-	swpShowWindow = 0x0040
-	hwndTopmost   = ^uintptr(0) // (HWND)-1
-
-	spiGetWorkArea = 0x0030
-
-	tpmRightButton = 0x0002
-	tpmReturnCmd   = 0x0100
-	tpmBottomAlign = 0x0020
-	tpmRightAlign  = 0x0008
-
-	mfString    = 0x0000
-	mfSeparator = 0x0800
-
-	modAlt      = 0x0001
-	modControl  = 0x0002
-	modShift    = 0x0004
-	modWin      = 0x0008
-	modNoRepeat = 0x4000
-
-	nimAdd        = 0x0000
-	nimModify     = 0x0001
-	nimDelete     = 0x0002
-	nimSetVersion = 0x0004
-
-	nifMessage = 0x0001
-	nifIcon    = 0x0002
-	nifTip     = 0x0004
-	nifShowTip = 0x0080
-
-	notifyIconVersion4 = 4
-
-	idcArrow       = 32512
-	biRGB          = 0
-	dibRGBColors   = 0
-	dwmCornerPref  = 33 // DWMWA_WINDOW_CORNER_PREFERENCE
-	dwmCornerRound = 2  // DWMWCP_ROUND
+	wmTray  = wmApp + 1 // tray icon callback
+	wmState = wmApp + 2 // posted by the poller when Sonar's state changed
 
 	hotkeyID = 1
 
-	idOpen = 0xE001
-	idQuit = 0xE002
+	idRemote, idAutostart, idQuit = 1, 2, 3
 
-	flyoutW = 384
-	flyoutH = 568
-	margin  = 12
-
-	// Tear down WebView2 (freeing its browser processes) after the flyout has
-	// been closed this long, so an idle tray costs almost nothing.
-	idleDestroy = 30 * time.Second
-
-	// ICoreWebView2Controller::Close is at vtable slot 24 (IUnknown's 3 slots +
-	// 21 preceding controller methods). The go-webview2 version is pinned in
-	// go.mod, so this layout is fixed; the wrapper doesn't expose Close itself.
-	controllerCloseSlot = 24
+	className    = "SonarRemoteFlyout"
+	runKey       = `Software\Microsoft\Windows\CurrentVersion\Run`
+	runValueName = "SonarRemote"
 )
 
-type point struct{ X, Y int32 }
-type rect struct{ Left, Top, Right, Bottom int32 }
-
-type msg struct {
-	Hwnd    uintptr
-	Message uint32
-	WParam  uintptr
-	LParam  uintptr
-	Time    uint32
-	Pt      point
-}
-
-type wndClassEx struct {
-	CbSize     uint32
-	Style      uint32
-	WndProc    uintptr
-	CbClsExtra int32
-	CbWndExtra int32
-	Instance   uintptr
-	Icon       uintptr
-	Cursor     uintptr
-	Background uintptr
-	MenuName   *uint16
-	ClassName  *uint16
-	IconSm     uintptr
-}
-
-type notifyIconData struct {
-	CbSize          uint32
-	Wnd             uintptr
-	ID              uint32
-	Flags           uint32
-	CallbackMessage uint32
-	Icon            uintptr
-	Tip             [128]uint16
-	State           uint32
-	StateMask       uint32
-	Info            [256]uint16
-	Version         uint32
-	InfoTitle       [64]uint16
-	InfoFlags       uint32
-	GuidItem        windows.GUID
-	BalloonIcon     uintptr
-}
-
-type iconInfo struct {
-	FIcon    int32
-	XHotspot uint32
-	YHotspot uint32
-	MaskBmp  uintptr
-	ColorBmp uintptr
-}
-
-type bitmapInfoHeader struct {
-	Size          uint32
-	Width         int32
-	Height        int32
-	Planes        uint16
-	BitCount      uint16
-	Compression   uint32
-	SizeImage     uint32
-	XPelsPerMeter int32
-	YPelsPerMeter int32
-	ClrUsed       uint32
-	ClrImportant  uint32
-}
-
-// ── App ─────────────────────────────────────────────────────────────────────
+// ErrAlreadyRunning is returned by Run when another instance owns the tray.
+var ErrAlreadyRunning = errors.New("sonar-remote is already running")
 
 type app struct {
-	hwnd     uintptr
-	chromium *edge.Chromium
-	visible  bool
-	idleGen  uint32 // bumps on every show/hide to invalidate stale idle timers
-	curIcon  uintptr
-	tip      string
-	url      string
-	shutdown func()
+	hwnd      uintptr
+	sonar     *sonar.Client
+	remoteURL string
+
+	// UI thread only.
+	scale            float64 // DPI / 96
+	th               theme
+	acrylic          bool
+	dib, memDC       uintptr
+	bits             unsafe.Pointer
+	dibW, dibH       int
+	textFam, iconFam uintptr
+	fText, fBold     uintptr
+	fIcon            uintptr
+	fmtLeft          uintptr
+	fmtCenter        uintptr
+	fmtRight         uintptr
+	hover, hoverPart int
+	drag, focus      int
+	kbd, tracking    bool
+	hiddenAt         time.Time
+	icon             uintptr
+	iconKey          string
+
+	visible atomic.Bool
+
+	mu     sync.Mutex
+	st     sonar.State
+	online bool
+	hold   [chatRow + 1]time.Time
+	pend   map[string]func() error
+	kick   chan struct{} // wakes the writer
+	wake   chan struct{} // wakes the poller
 }
 
-var a *app // single instance; the wndproc callback reaches it through this.
+var a *app // the single instance; wndProc reaches it through this
 
-// Run installs the tray icon + flyout and blocks on the Win32 message loop
-// until the user picks "Quitter" (or the window is destroyed). It must run on
-// the process's main goroutine. shutdown is invoked once, on quit, to stop the
-// HTTP server cleanly.
-func Run(host string, port int, shutdown func()) error {
+// Run shows the tray icon and blocks on the message loop until the user quits.
+// It must be called from the main goroutine.
+func Run(client *sonar.Client, remoteURL string) error {
 	runtime.LockOSThread()
 
-	url := fmt.Sprintf("http://localhost:%d", port)
-	if port == 80 {
-		url = "http://localhost"
+	if _, err := windows.CreateMutex(nil, false, windows.StringToUTF16Ptr(`Local\SonarRemote`)); err == windows.ERROR_ALREADY_EXISTS {
+		return ErrAlreadyRunning
 	}
-	a = &app{url: url, shutdown: shutdown}
+	pSetProcessDpiAwarenessC.Call(dpiPerMonitorV2)
+	gdipStart()
 
-	hinst, _, _ := pGetModuleHandleW.Call(0)
+	a = &app{
+		sonar: client, remoteURL: remoteURL,
+		hover: -1, drag: -1, focus: -1,
+		pend: map[string]func() error{},
+		kick: make(chan struct{}, 1), wake: make(chan struct{}, 1),
+	}
+	a.textFam = fontFamily("Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI")
+	a.iconFam = fontFamily("Segoe Fluent Icons", "Segoe MDL2 Assets")
+	a.fmtLeft, a.fmtCenter, a.fmtRight = newStringFormat(alignNear), newStringFormat(alignCenter), newStringFormat(alignFar)
+
+	hinst := windows.Handle(0)
+	windows.GetModuleHandleEx(0, nil, &hinst)
 	cursor, _, _ := pLoadCursorW.Call(0, idcArrow)
-	// Dark brush (COLORREF 0x00BBGGRR for #0d1117) so the window is never
-	// see-through, even for the instant before WebView2 paints.
-	brush, _, _ := pCreateSolidBrush.Call(0x00171110)
-	className := windows.StringToUTF16Ptr("SonarRemoteFlyout")
-
+	class := windows.StringToUTF16Ptr(className)
 	wc := wndClassEx{
-		CbSize:     uint32(unsafe.Sizeof(wndClassEx{})),
-		Style:      csDropShadow | csHRedraw | csVRedraw,
-		WndProc:    windows.NewCallback(wndProc),
-		Instance:   hinst,
-		Cursor:     cursor,
-		Background: brush,
-		ClassName:  className,
+		WndProc:   windows.NewCallback(wndProc),
+		Instance:  uintptr(hinst),
+		Cursor:    cursor,
+		ClassName: class,
 	}
-	if ret, _, err := pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc))); ret == 0 {
+	wc.CbSize = uint32(unsafe.Sizeof(wc))
+	if r, _, err := pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc))); r == 0 {
 		return fmt.Errorf("RegisterClassEx: %w", err)
 	}
-
 	hwnd, _, err := pCreateWindowExW.Call(
 		wsExToolWindow|wsExTopmost,
-		uintptr(unsafe.Pointer(className)),
+		uintptr(unsafe.Pointer(class)),
 		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr("Sonar Remote"))),
-		wsPopup,
-		0, 0, flyoutW, flyoutH,
-		0, 0, hinst, 0,
-	)
+		wsPopup, 0, 0, 0, 0, 0, 0, uintptr(hinst), 0) // sized on show
 	if hwnd == 0 {
 		return fmt.Errorf("CreateWindowEx: %w", err)
 	}
 	a.hwnd = hwnd
 
-	// Rounded corners (Windows 11); harmless if unsupported.
+	// Windows 11 chrome: rounded corners, and the acrylic backdrop where the
+	// build supports it (22H2+). Older systems get a flat themed background.
 	corner := int32(dwmCornerRound)
-	pDwmSetWindowAttribute.Call(hwnd, dwmCornerPref, uintptr(unsafe.Pointer(&corner)), 4)
+	pDwmSetWindowAttribute.Call(hwnd, dwmaCornerPreference, uintptr(unsafe.Pointer(&corner)), 4)
+	backdrop := int32(dwmBackdropAcrylic)
+	if hr, _, _ := pDwmSetWindowAttribute.Call(hwnd, dwmaSystemBackdropType, uintptr(unsafe.Pointer(&backdrop)), 4); hr == 0 {
+		a.acrylic = true
+		sheet := [4]int32{-1, -1, -1, -1}
+		pDwmExtendFrameIntoClientArea.Call(hwnd, uintptr(unsafe.Pointer(&sheet)))
+	}
 
-	// WebView2 is created lazily on the first open (see ensureWebview) so that a
-	// session where the flyout is never shown — e.g. a whole gaming session —
-	// spawns no browser processes and uses no extra RAM.
-
-	// Tray icon.
-	a.setIcon(0, false) // neutral placeholder until the first poll
-	nid := a.baseNID()
-	nid.Flags = nifMessage | nifIcon | nifTip | nifShowTip
-	nid.CallbackMessage = wmTray
-	nid.Icon = a.curIcon
-	copyTip(&nid, "Sonar Remote")
-	pShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
-	nid.Version = notifyIconVersion4
-	pShellNotifyIconW.Call(nimSetVersion, uintptr(unsafe.Pointer(&nid)))
-
-	// Global hotkey: Ctrl+Alt+S.
+	a.syncIcon()
 	pRegisterHotKey.Call(hwnd, hotkeyID, modControl|modAlt|modNoRepeat, 'S')
+	go a.poller()
+	go a.writer()
+	time.AfterFunc(10*time.Second, trimMemory) // once startup has settled
 
-	go a.pollMaster(port)
-
-	// Message loop.
 	var m msg
 	for {
-		r, _, _ := pGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+		r, _, err := pGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		if int32(r) <= 0 { // 0 = WM_QUIT, -1 = error
+			log.Printf("message loop ended: GetMessage=%d (%v)", int32(r), err)
 			break
 		}
 		pTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
 		pDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
 	}
-
-	a.removeTray()
-	if a.shutdown != nil {
-		a.shutdown()
-	}
+	nid := a.nid()
+	pShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
 	return nil
 }
 
 func wndProc(hwnd, message, wParam, lParam uintptr) uintptr {
+	// Client coordinates packed in lParam are signed 16-bit.
+	x, y := int(int16(lParam)), int(int16(lParam>>16))
 	switch message {
 	case wmTray:
-		switch uint32(lParam & 0xFFFF) {
-		case wmLButtonUp, ninSelect, ninKeySelect:
-			a.toggle()
-		case wmRButtonUp, wmContextMenu:
+		switch lParam & 0xFFFF {
+		case ninSelect, ninKeySelect:
+			// Clicking the icon while the flyout is open first deactivates
+			// (hides) it; don't reopen it on the same click.
+			if time.Since(a.hiddenAt) > 300*time.Millisecond {
+				a.show()
+			}
+		case wmContextMenu:
 			a.showMenu()
 		}
-		return 0
-
 	case wmHotkey:
-		if wParam == hotkeyID {
-			a.toggle()
+		if a.visible.Load() {
+			a.hide()
+		} else {
+			a.show()
 		}
-		return 0
-
 	case wmActivate:
-		// The flyout dismisses itself the moment it loses focus (EarTrumpet feel).
-		if (wParam & 0xFFFF) == waInactive {
+		if wParam&0xFFFF == 0 { // WA_INACTIVE: dismiss like a system flyout
 			a.hide()
 		}
-		return 0
-
-	case wmSize:
-		if a.chromium != nil {
-			a.chromium.Resize()
-		}
-		return 0
-
-	case wmUpdateIcon:
-		a.setIcon(int(wParam), lParam != 0)
-		a.refreshTray()
-		return 0
-
-	case wmDestroyWebview:
-		// Fire only if this timer is still the latest and the flyout is closed.
-		if uint32(wParam) == a.idleGen && !a.visible {
-			a.destroyWebview()
-		}
-		return 0
-
-	case wmCommand:
-		switch wParam & 0xFFFF {
-		case idOpen:
-			verb := windows.StringToUTF16Ptr("open")
-			target := windows.StringToUTF16Ptr(a.url)
-			pShellExecuteW.Call(0, uintptr(unsafe.Pointer(verb)), uintptr(unsafe.Pointer(target)), 0, 0, 1)
-		case idQuit:
-			pPostQuitMessage.Call(0)
-		}
-		return 0
-
+	case wmState:
+		a.stateChanged()
+	case wmPaint:
+		a.onPaint()
+	case wmEraseBkgnd:
+		return 1
+	case wmLButtonDown:
+		a.onMouseDown(x, y)
+	case wmMouseMove:
+		a.onMouseMove(x, y)
+	case wmLButtonUp:
+		pReleaseCapture.Call()
+	case wmCaptureChanged:
+		a.drag = -1
+		a.redraw()
+	case wmMouseLeave:
+		a.tracking, a.hover, a.hoverPart = false, -1, partNone
+		a.redraw()
+	case wmMouseWheel:
+		pt := point{int32(x), int32(y)} // wheel coordinates are screen-relative
+		pScreenToClient.Call(hwnd, uintptr(unsafe.Pointer(&pt)))
+		a.onWheel(int(pt.X), int(pt.Y), int(int16(wParam>>16))/120)
+	case wmKeyDown:
+		a.onKey(wParam)
 	case wmDestroy:
+		log.Print("window destroyed")
 		pPostQuitMessage.Call(0)
-		return 0
+	default:
+		r, _, _ := pDefWindowProcW.Call(hwnd, message, wParam, lParam)
+		return r
 	}
-	r, _, _ := pDefWindowProcW.Call(hwnd, message, wParam, lParam)
-	return r
+	return 0
 }
 
-// ── Flyout show/hide ────────────────────────────────────────────────────────
-
-func (a *app) toggle() {
-	if a.visible {
-		a.hide()
-	} else {
-		a.show()
-	}
-}
-
-// ensureWebview creates and embeds the WebView2 control the first time the
-// flyout is opened. Returns false if the runtime is unavailable.
-func (a *app) ensureWebview() bool {
-	if a.chromium != nil {
-		return true
-	}
-	c := edge.NewChromium()
-	if !c.Embed(a.hwnd) {
-		return false
-	}
-	// Match the app's dark background so the flyout never flashes white.
-	if c2 := c.GetController().GetICoreWebView2Controller2(); c2 != nil {
-		c2.PutDefaultBackgroundColor(edge.COREWEBVIEW2_COLOR{A: 0xFF, R: 0x0d, G: 0x11, B: 0x17})
-	}
-	if s, err := c.GetSettings(); err == nil {
-		s.PutAreDefaultContextMenusEnabled(false)
-		s.PutAreDevToolsEnabled(false)
-	}
-	a.chromium = c
-	c.Resize()
-	c.Navigate(a.url + "/flyout")
-	return true
-}
+// ── Flyout window ───────────────────────────────────────────────────────────
 
 func (a *app) show() {
-	a.idleGen++ // cancel any pending idle-destroy
-	if !a.ensureWebview() {
-		return
+	dpi, _, _ := pGetDpiForWindow.Call(a.hwnd)
+	if s := float64(dpi) / 96; s != a.scale {
+		a.scale = s
+		for _, f := range []uintptr{a.fText, a.fBold, a.fIcon} {
+			pGdipDeleteFont.Call(f)
+		}
+		a.fText, a.fBold = newFont(a.textFam, 14*s, false), newFont(a.textFam, 14*s, true)
+		a.fIcon = newFont(a.iconFam, 16*s, false)
 	}
-	// Anchor to the bottom-right of the work area, just above the taskbar.
+	a.th = loadTheme()
+	dark := int32(1)
+	if a.th.light {
+		dark = 0
+	}
+	pDwmSetWindowAttribute.Call(a.hwnd, dwmaUseImmersiveDarkMode, uintptr(unsafe.Pointer(&dark)), 4)
+
+	// shortcut: anchored to the primary work area's bottom-right corner, which
+	// is where the tray is unless the taskbar sits on a secondary monitor.
 	var wa rect
-	pSystemParametersInfo.Call(spiGetWorkArea, 0, uintptr(unsafe.Pointer(&wa)), 0)
-	x := wa.Right - flyoutW - margin
-	y := wa.Bottom - flyoutH - margin
-	// Show the window first, then (re)fit the WebView2 to the now-visible client
-	// rect — the controller is embedded while hidden, so its bounds are 0 until
-	// we resize against a real, on-screen client area.
-	pSetWindowPos.Call(a.hwnd, hwndTopmost, uintptr(x), uintptr(y), flyoutW, flyoutH, swpShowWindow)
-	pShowWindow.Call(a.hwnd, swShow)
-	if c := a.chromium.GetController(); c != nil {
-		c.PutIsVisible(true) // resume rendering + page timers
-	}
-	a.chromium.Resize()
+	pSystemParametersInfoW.Call(spiGetWorkArea, 0, uintptr(unsafe.Pointer(&wa)), 0)
+	w, h, m := a.px(winW), a.px(winH), a.px(12)
+	a.hover, a.drag, a.kbd = -1, -1, false
+	a.visible.Store(true)
+	pSetWindowPos.Call(a.hwnd, hwndTopmost, uintptr(int(wa.Right)-w-m), uintptr(int(wa.Bottom)-h-m),
+		uintptr(w), uintptr(h), swpShowWindow)
 	pSetForegroundWindow.Call(a.hwnd)
-	a.chromium.Focus()
-	a.visible = true
+	a.redraw()
+	select { // refresh now rather than at the next slow tick
+	case a.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (a *app) hide() {
-	if !a.visible {
+	if !a.visible.Swap(false) {
 		return
 	}
+	a.hiddenAt = time.Now()
 	pShowWindow.Call(a.hwnd, swHide)
-	// Tell WebView2 the content is hidden: it stops compositing and Chromium
-	// throttles the page, and our JS pauses polling on document.hidden — so a
-	// closed flyout costs virtually no CPU.
-	if a.chromium != nil {
-		if c := a.chromium.GetController(); c != nil {
-			c.PutIsVisible(false)
+	trimMemory()
+}
+
+// trimMemory hands the process's physical pages back to Windows. The app then
+// idles on the few it touches to poll; the rest fault back in on the next open.
+func trimMemory() {
+	windows.SetProcessWorkingSetSizeEx(windows.CurrentProcess(), ^uintptr(0), ^uintptr(0), 0)
+}
+
+func (a *app) onPaint() {
+	var ps paintStruct
+	hdc, _, _ := pBeginPaint.Call(a.hwnd, uintptr(unsafe.Pointer(&ps)))
+	w, h := a.px(winW), a.px(winH)
+	if w != a.dibW || h != a.dibH {
+		if a.memDC == 0 {
+			a.memDC, _, _ = pCreateCompatibleDC.Call(0)
+		}
+		old := a.dib
+		a.dib, a.bits = newDIB(w, h)
+		a.dibW, a.dibH = w, h
+		pSelectObject.Call(a.memDC, a.dib)
+		pDeleteObject.Call(old)
+	}
+	withGraphics(a.bits, w, h, a.paint)
+	pBitBlt.Call(hdc, 0, 0, uintptr(w), uintptr(h), a.memDC, 0, 0, srcCopy)
+	pEndPaint.Call(a.hwnd, uintptr(unsafe.Pointer(&ps)))
+}
+
+// stateChanged refreshes whatever shows the mixer state. UI thread only.
+func (a *app) stateChanged() {
+	a.syncIcon()
+	if a.visible.Load() {
+		a.redraw()
+	}
+}
+
+// ── Sonar I/O (off the UI thread) ───────────────────────────────────────────
+
+// poller mirrors Sonar's state: every second while the flyout is open, and
+// lazily otherwise, just to keep the tray icon honest.
+func (a *app) poller() {
+	for {
+		st, err := a.sonar.State()
+		a.mu.Lock()
+		changed := a.online != (err == nil)
+		a.online = err == nil
+		if err == nil {
+			now := time.Now()
+			for i := range st.Levels {
+				if now.Before(a.hold[i]) {
+					st.Levels[i] = a.st.Levels[i]
+				}
+			}
+			if now.Before(a.hold[chatRow]) {
+				st.ChatMix = a.st.ChatMix
+			}
+			changed = changed || st != a.st
+			a.st = st
+		}
+		a.mu.Unlock()
+		if changed {
+			pPostMessageW.Call(a.hwnd, wmState, 0, 0)
+		}
+		every := 5 * time.Second
+		if a.visible.Load() {
+			every = time.Second
+		}
+		select {
+		case <-a.wake:
+		case <-time.After(every):
 		}
 	}
-	a.visible = false
-
-	// Schedule a full teardown if the flyout stays closed. The timer only posts
-	// to the UI thread (COM lives there); show() bumps idleGen to cancel it.
-	a.idleGen++
-	gen := a.idleGen
-	time.AfterFunc(idleDestroy, func() {
-		pPostMessageW.Call(a.hwnd, wmDestroyWebview, uintptr(gen), 0)
-	})
 }
 
-// destroyWebview closes the WebView2 controller and drops our reference so the
-// browser processes exit; ensureWebview recreates it on the next open. Must run
-// on the UI thread.
-func (a *app) destroyWebview() {
-	if a.chromium == nil {
+// send queues a write, replacing any pending one with the same key so a drag
+// only ever sends its latest position.
+func (a *app) send(key string, fn func() error) {
+	a.mu.Lock()
+	a.pend[key] = fn
+	a.mu.Unlock()
+	select {
+	case a.kick <- struct{}{}:
+	default:
+	}
+}
+
+func (a *app) writer() {
+	for range a.kick {
+		a.mu.Lock()
+		batch := a.pend
+		a.pend = map[string]func() error{}
+		a.mu.Unlock()
+		for _, fn := range batch {
+			_ = fn() // a lost write is corrected by the next poll
+		}
+	}
+}
+
+// ── Tray icon and menu ──────────────────────────────────────────────────────
+
+func (a *app) nid() notifyIconData {
+	n := notifyIconData{Wnd: a.hwnd, ID: 1}
+	n.CbSize = uint32(unsafe.Sizeof(n))
+	return n
+}
+
+// syncIcon redraws the tray icon and tooltip when the master level, mute state
+// or taskbar theme changed since the last call.
+func (a *app) syncIcon() {
+	a.mu.Lock()
+	master, online := a.st.Levels[0], a.online
+	a.mu.Unlock()
+	pct, light := int(master.Volume*100+0.5), systemLight()
+	tip := fmt.Sprintf("Sonar : %d %%", pct)
+	switch {
+	case !online:
+		tip, pct = "Sonar est introuvable", 0
+	case master.Muted:
+		tip = "Sonar : muet"
+	}
+	key := fmt.Sprint(tip, light)
+	if key == a.iconKey {
 		return
 	}
-	if c := a.chromium.GetController(); c != nil {
-		c.PutIsVisible(false)
-		closeController(c)
+	first := a.icon == 0
+	a.iconKey = key
+
+	dpi, _, _ := pGetDpiForWindow.Call(a.hwnd)
+	size, _, _ := pGetSystemMetricsForDpi.Call(smCxSmIcon, dpi)
+	old := a.icon
+	a.icon = meterIcon(int(size), pct, master.Muted || !online, light)
+
+	n := a.nid()
+	n.Flags = nifMessage | nifIcon | nifTip | nifShowTip
+	n.CallbackMessage = wmTray
+	n.Icon = a.icon
+	copy(n.Tip[:len(n.Tip)-1], windows.StringToUTF16(tip))
+	if first {
+		pShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&n)))
+		n.Version = notifyIconVersion4
+		pShellNotifyIconW.Call(nimSetVersion, uintptr(unsafe.Pointer(&n)))
+	} else {
+		pShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(&n)))
+		pDestroyIcon.Call(old)
 	}
-	a.chromium = nil
 }
 
-// controllerRaw mirrors the memory layout of edge.ICoreWebView2Controller (a
-// single leading vtable pointer) so we can reach COM methods the wrapper omits.
-type controllerRaw struct {
-	vtbl *[controllerCloseSlot + 1]edge.ComProc
-}
-
-// closeController invokes ICoreWebView2Controller::Close (vtable slot
-// controllerCloseSlot); go-webview2 doesn't wrap it. The layout is fixed by the
-// pinned module version.
-func closeController(c *edge.ICoreWebView2Controller) {
-	raw := (*controllerRaw)(unsafe.Pointer(c))
-	raw.vtbl[controllerCloseSlot].Call(uintptr(unsafe.Pointer(c)))
+// meterIcon draws five rising bars, lit up to the master level, in the
+// taskbar's foreground colour. off dims them all and strikes them through.
+func meterIcon(size, pct int, off, light bool) uintptr {
+	color, bits := newDIB(size, size)
+	if color == 0 {
+		return 0
+	}
+	px := unsafe.Slice((*uint32)(bits), size*size)
+	// Premultiplied BGRA: full and 35 % opacity of the foreground colour.
+	lit, dim := uint32(0xFFFFFFFF), uint32(0x59595959)
+	if light {
+		lit, dim = 0xFF000000, 0x59000000
+	}
+	gap := max(1, size/12)
+	bw := (size - 4*gap) / 5
+	x0 := (size - 5*bw - 4*gap) / 2
+	litBars := (pct*5 + 50) / 100
+	for i := 0; i < 5; i++ {
+		c := dim
+		if !off && i < litBars {
+			c = lit
+		}
+		h := (size - 2) * (i + 3) / 7
+		for y := size - 1 - h; y < size-1; y++ {
+			for x := x0 + i*(bw+gap); x < x0+i*(bw+gap)+bw; x++ {
+				px[y*size+x] = c
+			}
+		}
+	}
+	if off {
+		for d := 1; d < size-1; d++ { // diagonal strike, two pixels thick
+			px[d*size+d], px[d*size+d-1] = 0xFFE5484D, 0xFFE5484D
+		}
+	}
+	mask, _, _ := pCreateBitmap.Call(uintptr(size), uintptr(size), 1, 1, 0)
+	ii := iconInfo{FIcon: 1, MaskBmp: mask, ColorBmp: color}
+	icon, _, _ := pCreateIconIndirect.Call(uintptr(unsafe.Pointer(&ii)))
+	pDeleteObject.Call(color)
+	pDeleteObject.Call(mask)
+	return icon
 }
 
 func (a *app) showMenu() {
@@ -501,208 +449,65 @@ func (a *app) showMenu() {
 		return
 	}
 	defer pDestroyMenu.Call(menu)
-	pAppendMenuW.Call(menu, mfString, idOpen,
-		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr("Ouvrir dans le navigateur"))))
-	pAppendMenuW.Call(menu, mfSeparator, 0, 0)
-	pAppendMenuW.Call(menu, mfString, idQuit,
-		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr("Quitter"))))
+	add := func(flags, id uintptr, label string) {
+		pAppendMenuW.Call(menu, flags, id, uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(label))))
+	}
+	auto := uintptr(mfString)
+	if autostart() {
+		auto |= mfChecked
+	}
+	add(mfString, idRemote, "Ouvrir la télécommande web")
+	add(auto, idAutostart, "Lancer au démarrage de Windows")
+	add(mfSeparator, 0, "")
+	add(mfString, idQuit, "Quitter")
 
-	// Foreground dance so the menu dismisses correctly for a tray owner window.
+	// A tray menu only dismisses properly if its owner is the foreground window.
 	pSetForegroundWindow.Call(a.hwnd)
 	var pt point
-	if p := getCursorPos(); p != nil {
-		pt = *p
-	}
-	cmd, _, _ := pTrackPopupMenu.Call(menu,
-		tpmRightButton|tpmReturnCmd|tpmBottomAlign|tpmRightAlign,
+	pGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	cmd, _, _ := pTrackPopupMenu.Call(menu, tpmRightButton|tpmReturnCmd|tpmBottomAlign|tpmRightAlign,
 		uintptr(pt.X), uintptr(pt.Y), 0, a.hwnd, 0)
-	pPostMessageW.Call(a.hwnd, 0 /*WM_NULL*/, 0, 0)
-	if cmd != 0 {
-		pPostMessageW.Call(a.hwnd, wmCommand, cmd&0xFFFF, 0)
+	switch cmd {
+	case idRemote:
+		pShellExecuteW.Call(0, uintptr(unsafe.Pointer(windows.StringToUTF16Ptr("open"))),
+			uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(a.remoteURL))), 0, 0, 1)
+	case idAutostart:
+		setAutostart(auto&mfChecked == 0)
+	case idQuit:
+		pPostQuitMessage.Call(0)
 	}
 }
 
-var pGetCursorPos = user32.NewProc("GetCursorPos")
+// ── Launch at logon (HKCU Run key, no admin needed) ─────────────────────────
 
-func getCursorPos() *point {
-	var p point
-	if r, _, _ := pGetCursorPos.Call(uintptr(unsafe.Pointer(&p))); r == 0 {
-		return nil
+func autostart() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, runKey, registry.QUERY_VALUE)
+	if err != nil {
+		return false
 	}
-	return &p
+	defer k.Close()
+	_, _, err = k.GetStringValue(runValueName)
+	return err == nil
 }
 
-// ── Tray icon (drawn in-process, reflects the master level) ─────────────────
-
-func (a *app) baseNID() notifyIconData {
-	return notifyIconData{
-		CbSize: uint32(unsafe.Sizeof(notifyIconData{})),
-		Wnd:    a.hwnd,
-		ID:     1,
-	}
-}
-
-// refreshTray pushes the current icon + tooltip to the shell.
-func (a *app) refreshTray() {
-	nid := a.baseNID()
-	nid.Flags = nifIcon | nifTip | nifShowTip
-	nid.Icon = a.curIcon
-	copyTip(&nid, a.tip)
-	pShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(&nid)))
-}
-
-func (a *app) removeTray() {
-	nid := a.baseNID()
-	pShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
-}
-
-// setIcon builds a fresh HICON for the given master volume (0..100) and mute
-// state, replacing the previous one. Called on the UI thread only.
-func (a *app) setIcon(volPct int, muted bool) {
-	h := buildMeterIcon(volPct, muted)
-	if h == 0 {
+// setAutostart registers this executable with the flags it is running with.
+func setAutostart(on bool) {
+	k, err := registry.OpenKey(registry.CURRENT_USER, runKey, registry.SET_VALUE)
+	if err != nil {
 		return
 	}
-	if a.curIcon != 0 {
-		pDestroyIcon.Call(a.curIcon)
+	defer k.Close()
+	if !on {
+		k.DeleteValue(runValueName)
+		return
 	}
-	a.curIcon = h
-	if muted {
-		a.tip = "Sonar — Muet"
-	} else {
-		a.tip = fmt.Sprintf("Sonar — Master %d%%", volPct)
-	}
-}
-
-// buildMeterIcon renders a 5-bar level meter into a 32x32 BGRA icon.
-func buildMeterIcon(volPct int, muted bool) uintptr {
-	const dim = 32
-	var bits unsafe.Pointer
-	bmi := bitmapInfoHeader{
-		Size:        uint32(unsafe.Sizeof(bitmapInfoHeader{})),
-		Width:       dim,
-		Height:      -dim, // top-down
-		Planes:      1,
-		BitCount:    32,
-		Compression: biRGB,
-	}
-	color, _, _ := pCreateDIBSection.Call(0, uintptr(unsafe.Pointer(&bmi)), dibRGBColors,
-		uintptr(unsafe.Pointer(&bits)), 0, 0)
-	if color == 0 || bits == nil {
-		return 0
-	}
-	px := unsafe.Slice((*uint32)(bits), dim*dim)
-	for i := range px {
-		px[i] = 0 // transparent
-	}
-	set := func(x, y int, c uint32) {
-		if x >= 0 && x < dim && y >= 0 && y < dim {
-			px[y*dim+x] = c
-		}
-	}
-
-	const (
-		lit   = 0xFF5B8CFF
-		unlit = 0xFF39415A
-		gray  = 0xFF5A6072
-		redSl = 0xFFFF4D4D
-	)
-	litCount := (volPct*5 + 50) / 100 // round to nearest of 5
-	baseline := 27
-	bw, gap := 4, 1
-	totalW := 5*bw + 4*gap
-	startX := (dim - totalW) / 2
-	for i := 0; i < 5; i++ {
-		h := 8 + i*4 // 8,12,16,20,24
-		x0 := startX + i*(bw+gap)
-		var col uint32 = unlit
-		if muted {
-			col = gray
-		} else if i < litCount {
-			col = lit
-		}
-		for y := baseline - h; y <= baseline; y++ {
-			for x := x0; x < x0+bw; x++ {
-				set(x, y, col)
-			}
-		}
-	}
-	if muted {
-		for d := 0; d < dim; d++ { // 3px diagonal slash
-			set(d, d, redSl)
-			set(d+1, d, redSl)
-			set(d, d+1, redSl)
-		}
-	}
-
-	// A 1bpp all-zero mask; the 32bpp alpha channel does the real masking.
-	mask, _, _ := pCreateBitmap.Call(dim, dim, 1, 1, 0)
-	ii := iconInfo{FIcon: 1, MaskBmp: mask, ColorBmp: color}
-	hicon, _, _ := pCreateIconIndirect.Call(uintptr(unsafe.Pointer(&ii)))
-	pDeleteObject.Call(color)
-	pDeleteObject.Call(mask)
-	return hicon
-}
-
-func copyTip(nid *notifyIconData, s string) {
-	u := windows.StringToUTF16(s)
-	if len(u) > len(nid.Tip) {
-		u = u[:len(nid.Tip)]
-		u[len(u)-1] = 0
-	}
-	copy(nid.Tip[:], u)
-}
-
-// ── Master-level poller ─────────────────────────────────────────────────────
-
-func (a *app) pollMaster(port int) {
-	url := fmt.Sprintf("http://127.0.0.1:%d/api/volumeSettings/classic", port)
-	client := &http.Client{Timeout: 2 * time.Second}
-	lastVol, lastMuted, first := -1, false, true
-	for {
-		if vol, muted, ok := fetchMaster(client, url); ok {
-			// Only rebuild + push the icon when it would actually change.
-			if first || vol != lastVol || muted != lastMuted {
-				pPostMessageW.Call(a.hwnd, wmUpdateIcon, uintptr(vol), boolToUintptr(muted))
-				lastVol, lastMuted, first = vol, muted, false
-			}
-		}
-		time.Sleep(5 * time.Second)
-	}
-}
-
-func fetchMaster(client *http.Client, url string) (volPct int, muted, ok bool) {
-	resp, err := client.Get(url)
+	exe, err := os.Executable()
 	if err != nil {
-		return 0, false, false
+		return
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, false, false
+	cmd := syscall.EscapeArg(exe)
+	for _, arg := range os.Args[1:] {
+		cmd += " " + syscall.EscapeArg(arg)
 	}
-	var body struct {
-		Masters struct {
-			Classic struct {
-				Volume float64 `json:"volume"`
-				Muted  bool    `json:"muted"`
-			} `json:"classic"`
-		} `json:"masters"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return 0, false, false
-	}
-	v := body.Masters.Classic.Volume
-	if v < 0 {
-		v = 0
-	} else if v > 1 {
-		v = 1
-	}
-	return int(v*100 + 0.5), body.Masters.Classic.Muted, true
-}
-
-func boolToUintptr(b bool) uintptr {
-	if b {
-		return 1
-	}
-	return 0
+	k.SetStringValue(runValueName, cmd)
 }

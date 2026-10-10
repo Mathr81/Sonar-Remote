@@ -15,22 +15,28 @@ import (
 )
 
 // Discovery chain:
-//   1. coreProps.json -> ggEncryptedAddress
-//   2. https://{ggEncryptedAddress}/subApps  (self-signed TLS)
-//   3. subApps.sonar.metadata.webServerAddress -> the API base URL
+//  1. coreProps.json -> ggEncryptedAddress
+//  2. https://{ggEncryptedAddress}/subApps  (self-signed TLS)
+//  3. subApps.sonar.metadata.webServerAddress -> the API base URL
 type Client struct {
 	mu    sync.RWMutex
 	base  *url.URL
 	disco *http.Client
+	api   *http.Client // direct API calls (see api.go)
 }
 
 func NewClient() *Client {
-	return &Client{
+	c := &Client{
 		disco: &http.Client{
 			Timeout:   4 * time.Second,
 			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 		},
 	}
+	c.api = &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: &retryTransport{c: c, next: http.DefaultTransport},
+	}
+	return c
 }
 
 // Base returns the currently known Sonar API base URL (nil until discovered).
@@ -99,18 +105,4 @@ func (c *Client) Discover() error {
 	c.base = u
 	c.mu.Unlock()
 	return nil
-}
-
-// EnsureDiscovered performs an initial discovery, retrying quietly in the
-// background if Sonar isn't up yet so the server can start immediately.
-func (c *Client) EnsureDiscovered() {
-	if err := c.Discover(); err == nil {
-		return
-	}
-	go func() {
-		for c.Base() == nil {
-			time.Sleep(3 * time.Second)
-			_ = c.Discover()
-		}
-	}()
 }

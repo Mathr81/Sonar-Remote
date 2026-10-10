@@ -1,3 +1,5 @@
+// Sonar Remote controls SteelSeries Sonar from the Windows tray and, over the
+// LAN, from any browser (http://sonar.local).
 package main
 
 import (
@@ -8,13 +10,12 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"mime"
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
+	"runtime/debug"
 	"strconv"
-	"strings"
-	"syscall"
 	"time"
 
 	"sonar-remote/internal/desktop"
@@ -26,21 +27,26 @@ import (
 var embeddedWeb embed.FS
 
 func main() {
-	port := flag.Int("port", 80, "HTTP port to listen on (80 = bare http://<host>.local)")
+	port := flag.Int("port", 80, "HTTP port of the web remote (80 = bare http://<host>.local)")
 	host := flag.String("host", "sonar", "mDNS hostname (published as <host>.local)")
 	noMDNS := flag.Bool("no-mdns", false, "disable mDNS advertising")
-	noTray := flag.Bool("no-tray", false, "disable the Windows tray icon + flyout (headless server only)")
+	noTray := flag.Bool("no-tray", false, "serve the web remote only, without the tray mixer")
+	logFile := flag.String("log", "", "write logs and crash traces to this file (the release build has no console)")
 	flag.Parse()
 
-	// Windows' MIME registry is unreliable; pin the types we serve.
-	mime.AddExtensionType(".webmanifest", "application/manifest+json")
-	mime.AddExtensionType(".svg", "image/svg+xml")
-	mime.AddExtensionType(".js", "text/javascript")
-	mime.AddExtensionType(".css", "text/css")
+	if *logFile != "" {
+		if f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			log.SetOutput(f)
+			debug.SetCrashOutput(f, debug.CrashOptions{})
+		}
+	}
 
 	client := sonar.NewClient()
-	client.EnsureDiscovered()
 
+	web, err := fs.Sub(embeddedWeb, "web/dist")
+	if err != nil {
+		log.Fatalf("embed: %v", err)
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/api/", client.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -50,89 +56,69 @@ func main() {
 		}
 		http.Error(w, `{"status":"discovering"}`, http.StatusServiceUnavailable)
 	})
-	mux.Handle("/", spaHandler())
-
-	if !*noMDNS {
-		if stop, method, err := mdnsx.Advertise(*host, *port); err != nil {
-			log.Printf("mDNS disabled: %v", err)
-		} else {
-			defer stop()
-			log.Printf("mDNS: advertising %s.local via %s", *host, method)
-		}
-	}
+	mux.Handle("/", static(web))
 
 	srv := &http.Server{
 		Addr:              ":" + strconv.Itoa(*port),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-
 	go func() {
-		printBanner(*host, *port)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("server error: %v", err)
+		// The tray mixer talks to Sonar directly, so it keeps working even if
+		// the port is taken and the web remote can't start.
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("web remote unavailable: %v", err)
 		}
 	}()
-
-	shutdown := func() {
-		log.Println("shutting down…")
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
+	if !*noMDNS {
+		defer mdnsx.Advertise(*host, *port)()
 	}
 
 	if *noTray {
 		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		signal.Notify(sig, os.Interrupt)
 		<-sig
-		shutdown()
-		return
+	} else {
+		url := "http://localhost"
+		if *port != 80 {
+			url += ":" + strconv.Itoa(*port)
+		}
+		if err := desktop.Run(client, url); err != nil {
+			log.Fatal(err)
+		}
+		log.Print("tray closed, exiting")
 	}
-
-	// Windows: run the tray icon + flyout (blocks until the user quits).
-	// Elsewhere: desktop.Run just waits for a signal.
-	if err := desktop.Run(*host, *port, shutdown); err != nil {
-		log.Printf("tray unavailable (%v); falling back to headless server", err)
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		<-sig
-		shutdown()
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
 }
 
-// spaHandler serves the embedded Svelte build, falling back to index.html.
-func spaHandler() http.Handler {
-	sub, err := fs.Sub(embeddedWeb, "web/dist")
-	if err != nil {
-		log.Fatalf("embed: %v", err)
-	}
-	fileServer := http.FileServer(http.FS(sub))
+// contentTypes of the embedded files, set by hand so the mime package never
+// reads Windows' MIME registry: it is unreliable (.js is often text/plain), and
+// with Go 1.27.0 that read crashed the process at the next GC when it was
+// started from Explorer or at logon rather than from a terminal.
+var contentTypes = map[string]string{
+	".html":        "text/html; charset=utf-8",
+	".js":          "text/javascript",
+	".css":         "text/css",
+	".svg":         "image/svg+xml",
+	".png":         "image/png",
+	".webmanifest": "application/manifest+json",
+}
+
+func static(files fs.FS) http.Handler {
+	server := http.FileServerFS(files)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := strings.TrimPrefix(r.URL.Path, "/")
-		if p == "" {
-			p = "index.html"
+		ext := path.Ext(r.URL.Path)
+		if ext == "" {
+			ext = ".html" // "/" serves index.html
 		}
-		if _, err := fs.Stat(sub, p); err != nil {
-			r.URL.Path = "/"
+		ctype, ok := contentTypes[ext]
+		if !ok {
+			http.NotFound(w, r)
+			return
 		}
-		fileServer.ServeHTTP(w, r)
+		w.Header().Set("Content-Type", ctype)
+		server.ServeHTTP(w, r)
 	})
-}
-
-func printBanner(host string, port int) {
-	suffix := ""
-	if port != 80 {
-		suffix = ":" + strconv.Itoa(port)
-	}
-	fmt.Println()
-	fmt.Println("  ╔══════════════════════════════════════════╗")
-	fmt.Println("  ║           Sonar Remote — en ligne          ║")
-	fmt.Println("  ╚══════════════════════════════════════════╝")
-	fmt.Printf("   • Local     : http://localhost%s\n", suffix)
-	fmt.Printf("   • mDNS      : http://%s.local%s\n", host, suffix)
-	for _, ip := range mdnsx.LocalIPv4() {
-		fmt.Printf("   • Réseau    : http://%s%s\n", ip, suffix)
-	}
-	fmt.Println()
-	log.Println("ready")
 }

@@ -190,7 +190,7 @@ paths:
           description: OK
 
   # --- CHAT MIX ---
-  /chatMix:
+  /v1/chatMix:
     get:
       summary: Balance ChatMix
       tags: [Volume (Classic)]
