@@ -1,162 +1,116 @@
 # Sonar Remote
 
-Contrôle **SteelSeries Sonar** à distance depuis ton iPad / téléphone / autre PC,
-via une interface web tactile moderne. Un seul petit exécutable tourne sur le PC :
-il découvre le port (rotatif) de Sonar, proxifie son API, sert l'interface web, et
-s'annonce en **mDNS** sous `sonar.local`.
+Un mixer **SteelSeries Sonar** dans la barre des tâches de Windows, et une
+télécommande web pour le piloter depuis un iPad ou un téléphone.
 
-Et directement sur le PC : un **mixer dans la barre des tâches** (façon EarTrumpet),
-avec icône dynamique et raccourci clavier — pratique quand l'iPad n'est pas à portée.
+Un seul exécutable de 8 Mo, sans installation ni dépendance : il trouve le port
+(changeant) de Sonar, dessine lui-même son mixer, sert la télécommande et
+s'annonce sur le réseau sous `sonar.local`.
 
-![aperçu](docs/preview.png)
+| Mixer de bureau | Télécommande web |
+|---|---|
+| ![Le mixer de la barre des tâches](docs/flyout.png) | ![La télécommande sur iPad](docs/preview.png) |
 
-## Fonctionnalités
+## Mixer de bureau
 
-- 🎚️ Faders verticaux tactiles + boutons mute par canal (Master, Game, Chat, Média, Aux, Micro)
-- 🖥️ **Mixer de bureau dans le tray** (Windows) façon EarTrumpet : icône dynamique reflétant le Master, flyout compact, raccourci global **Ctrl+Alt+S** (voir plus bas)
-- 🎛️ Balance **ChatMix** (jeu ⇄ chat)
-- 🔄 Synchro live (~1 s) : bouger un slider dans l'app Sonar du PC se reflète sur l'iPad, et inversement
-- 🏷️ Affiche le preset EQ et le périphérique de sortie de chaque canal
-- 🔊 Changer le périphérique de sortie (classic) : tape sur le nom d'appareil d'un canal de rendu → sélecteur des sorties physiques disponibles
-- 🎤 Changer le micro (entrée) : tape sur l'appareil du canal Micro → sélecteur des entrées physiques
-- 🎚️ Voir les applications routées sur chaque canal et les déplacer d'un canal à l'autre (tape une app → choisis le canal cible)
-- ⚙️ Réglages d'affichage (icône engrenage) : choisis ce qui s'affiche — profils EQ, périphériques, applications, ChatMix, et chaque canal individuellement. Idéal pour les petits écrans. Mémorisé sur l'appareil (localStorage)
-- 📡 Découverte automatique du port dynamique de Sonar (auto-réparation si Sonar redémarre)
-- 🌐 `sonar.local` en mDNS (résolu nativement par iOS/macOS via Bonjour)
-- 📦 Binaire Go unique (~11 Mo), interface embarquée, ~10 Mo de RAM au repos (le mixer de bureau ne charge WebView2 qu'à l'ouverture et le libère après 30 s de fermeture)
+- **Ouvrir / fermer** : clic sur l'icône du tray ou **Ctrl+Alt+S**. Il se ferme
+  tout seul dès qu'il perd le focus, ou avec Échap.
+- **Régler** : glisser un curseur, molette au-dessus d'une ligne, clic sur
+  l'icône d'un canal pour le couper. Master, Jeu, Chat, Média, Aux, Micro et ChatMix.
+- **Clavier** : ↑ ↓ pour changer de ligne, ← → pour régler, Espace ou M pour couper.
+- **Icône** : cinq barres qui suivent le volume Master, barrées quand il est coupé.
+- **Clic droit** : ouvrir la télécommande web, lancer au démarrage de Windows, quitter.
 
-## Stack
+Le mixer est une fenêtre Win32 native dessinée en GDI+ : il s'ouvre en un
+dixième de seconde, suit le thème clair/sombre et la couleur d'accentuation de
+Windows, et ne lance aucun processus navigateur. Au repos, l'application occupe
+10 à 15 Mo de mémoire et pratiquement aucun temps processeur.
 
-| Couche      | Techno |
-|-------------|--------|
-| Backend     | Go (net/http reverse-proxy, `grandcat/zeroconf` pour le mDNS, UI embarquée via `embed`) |
-| Frontend    | Svelte 5 + Vite + TypeScript (bundle ~19 Ko gzip) |
-| Tray (Win)  | Win32 natif (`golang.org/x/sys/windows`) pour l'icône/hotkey, flyout via WebView2 (`jchv/go-webview2`, sans CGO) |
+## Télécommande web
 
-## Démarrage rapide
+Sur un appareil du même réseau Wi-Fi, ouvre **http://sonar.local**. Sur iOS,
+*Partager → Sur l'écran d'accueil* en fait une app plein écran.
 
-Prérequis : [Go](https://go.dev/dl/) ≥ 1.22 et [Bun](https://bun.sh) (pour builder l'UI).
+- Un fader par canal, avec bouton de coupure, et le ChatMix en bas.
+- Choix de la sortie audio et du micro depuis la barre du haut.
+- Les applications en cours apparaissent sous leur canal : touche-en une pour
+  l'envoyer vers un autre.
+- L'engrenage choisit ce qui s'affiche (canaux, profils d'égaliseur,
+  applications, ChatMix), mémorisé sur chaque appareil.
+- Sur un écran étroit, les canaux passent en lignes horizontales.
+
+## Installation
+
+Compile `sonar-remote.exe` (voir plus bas) ou récupère-le dans les
+[releases](../../releases), lance-le, puis coche *Lancer au démarrage de
+Windows* dans le menu du tray.
+
+Au premier lancement, autorise l'application sur les réseaux **privés** si tu
+veux la télécommande web.
+
+```
+sonar-remote.exe [options]
+  --port     Port de la télécommande web (défaut 80 → http://<host>.local sans port)
+  --host     Nom publié en mDNS, <host>.local (défaut "sonar")
+  --no-mdns  Ne pas s'annoncer sur le réseau
+  --no-tray  Télécommande web seule, sans le mixer de bureau
+  --log      Fichier où écrire les journaux et les traces de plantage
+```
+
+Les options passées au lancement sont conservées par *Lancer au démarrage*.
+
+## Compiler
+
+Il faut [Go](https://go.dev/dl/) et [Bun](https://bun.sh).
 
 ```powershell
-# 1. Build (UI + binaire)
-./build.ps1
-
-# 2. Lancer
-./sonar-remote.exe            # http://localhost  et  http://sonar.local
+./build.ps1          # télécommande web + sonar-remote.exe
+go test ./...
 ```
 
-Puis sur l'iPad (même réseau Wi-Fi) : ouvre **http://sonar.local**.
-Astuce iOS : *Partager → Sur l'écran d'accueil* → tu obtiens une **icône** dédiée
-et une app plein écran (nom « Sonar », mode standalone via le web manifest).
-
-## Options
-
-```
-./sonar-remote.exe --port 80 --host sonar
-  --port     Port HTTP (défaut 80 → http://<host>.local sans port)
-  --host     Nom mDNS publié <host>.local (défaut "sonar")
-  --no-mdns  Désactive l'annonce mDNS
-  --no-tray  Désactive le mixer de bureau (serveur seul, sans icône tray)
-```
-
-Si le port 80 est déjà pris (IIS/http.sys), utilise `--port 8080` → `http://sonar.local:8080`.
-
-## Mixer de bureau (barre des tâches)
-
-Sous Windows, en plus du serveur web, l'app pose une **icône dans le tray** et un
-petit **flyout** pour piloter tous les canaux sans sortir du jeu :
-
-- **Ouvrir / fermer** : clic gauche sur l'icône, ou le raccourci global **Ctrl+Alt+S**.
-- **Icône dynamique** : reflète le volume et le mute du Master (mise à jour toutes les ~5 s).
-- **Flyout** : un slider horizontal + mute par canal, plus le ChatMix — se referme
-  tout seul quand il perd le focus (comme EarTrumpet).
-- **Clic droit** sur l'icône : *Ouvrir dans le navigateur* / *Quitter*.
-- **Frugal** : WebView2 (déjà présent sur Windows 11) n'est chargé qu'à la première
-  ouverture, et **détruit après 30 s** de fermeture — au repos, l'app tient en ~10 Mo
-  sans processus navigateur. Le raccourci utilise le runtime WebView2 *Evergreen*.
-
-Le mixer réutilise le même serveur local : l'accès iPad via `sonar.local` continue
-de fonctionner en parallèle. Pour un fonctionnement purement headless, lance avec
-`--no-tray`.
-
-> **mDNS** : si Apple Bonjour (`dns-sd`, installé avec iTunes/Bonjour) est présent,
-> le serveur enregistre `sonar.local` **via Bonjour** — c'est le résolveur auquel iOS
-> fait confiance, et faire tourner un second répondeur mDNS en parallèle crée des
-> réponses en conflit (nom résolu mais connexion qui échoue). Sinon, un répondeur
-> intégré prend le relais. Dans les deux cas on n'annonce **que ton IP LAN
-> principale** (route par défaut) : publier tous les adaptateurs (VPN/WSL/VirtualBox,
-> link-local) ferait choisir au client une adresse injoignable → chargement infini.
->
-> Le tout premier accès à `sonar.local` peut prendre 1–3 s (propagation mDNS), puis
-> c'est instantané (mis en cache). L'IP directe reste toujours dispo en secours.
-
-## Lancer au démarrage de Windows
+Pour travailler sur la télécommande avec rechargement à chaud :
 
 ```powershell
-./install-startup.ps1                 # tâche planifiée au logon, tourne en fond
-./install-startup.ps1 -Port 80        # variante port 80
-./install-startup.ps1 -Remove         # désinstaller
+go run . --port 8080        # terminal 1 : l'application, journaux dans la console
+cd web; bun run dev         # terminal 2 : Vite, qui relaie /api vers :8080
 ```
 
-La tâche démarre l'app sans fenêtre de console (lanceur `.vbs`) mais **l'icône du
-tray reste disponible** : tu peux ouvrir le mixer avec `Ctrl+Alt+S` dès l'ouverture
-de session.
+Pousser un tag `v*` publie une release avec l'exécutable (voir
+[`.github/workflows/build.yml`](.github/workflows/build.yml)).
 
-## Pare-feu
-
-Au premier lancement, autorise l'app sur les réseaux **privés**. Sinon :
-
-```powershell
-New-NetFirewallRule -DisplayName "Sonar Remote" -Direction Inbound `
-  -Program "$PWD\sonar-remote.exe" -Action Allow -Profile Private
-```
-
-## Architecture
+## Fonctionnement
 
 ```
-iPad  ──http──▶  sonar-remote.exe  ──http──▶  Sonar (127.0.0.1:PORT dynamique)
-                 │  /api/*  → reverse-proxy vers Sonar (re-découverte auto)
-                 │  /*      → interface Svelte embarquée
-                 │  /flyout → variante compacte servie au mixer de bureau
-                 ├  mDNS    → publie sonar.local (A + _http._tcp)
-                 └  tray    → icône Win32 + flyout WebView2 (localhost, même serveur)
+                          sonar-remote.exe
+tray + raccourci ──▶ mixer natif ──────────┐
+                                           ├──▶ Sonar (127.0.0.1, port changeant)
+iPad ──http──▶ /       télécommande web    │
+               /api/*  relais ─────────────┘
+               mDNS    sonar.local
 ```
 
-Découverte du port Sonar : `C:\ProgramData\SteelSeries\GG\coreProps.json`
-→ `ggEncryptedAddress` → `https://.../subApps` (TLS auto-signé)
-→ `subApps.sonar.metadata.webServerAddress`.
+| Dossier | Rôle |
+|---|---|
+| `internal/sonar` | Trouve Sonar et lui parle : `coreProps.json` → `ggEncryptedAddress` → `/subApps` → adresse de l'API. Redécouvre l'adresse et réessaie quand Sonar redémarre. |
+| `internal/desktop` | Icône du tray, raccourci global, mixer (Win32 + GDI+, sans CGO). |
+| `internal/mdnsx` | Publie `sonar.local`, par Bonjour s'il est installé, sinon par un répondeur intégré. Suit les changements d'adresse IP. |
+| `web` | La télécommande : Svelte 5 + Vite, 22 Ko gzip, embarquée dans l'exécutable. |
+
+L'API de Sonar n'est pas documentée par SteelSeries ; ce qui en est utilisé ici
+est décrit dans [`openapi.yaml`](openapi.yaml).
 
 ## Dépannage
 
 | Symptôme | Piste |
-|----------|-------|
-| UI affiche « Hors ligne » | SteelSeries GG / Sonar doit tourner. `curl http://localhost/healthz` |
-| `sonar.local` ne résout pas sur iPad | Même réseau ? Wi-Fi qui isole les clients (AP isolation) ? Essaie l'IP directe affichée au démarrage. |
-| Port 80 refusé | http.sys/IIS l'occupe → utilise 8080. |
-| `go build` échoue sur l'embed | Build l'UI d'abord (`web/dist` doit exister) — utilise `./build.ps1`. |
+|---|---|
+| « Sonar est introuvable » | SteelSeries GG et Sonar doivent tourner. La reconnexion est automatique. |
+| `sonar.local` ne répond pas | Même réseau ? Certains Wi-Fi isolent les appareils entre eux : essaie l'adresse IP du PC. |
+| La télécommande ne s'ouvre pas, le mixer si | Le port 80 est pris par un autre programme : lance avec `--port 8080`. |
+| Rien ne se passe au lancement | Relance avec `--log sonar.log` et regarde le fichier. |
 
-## Build automatisé (CI)
+Seul le mode Classic de Sonar est pris en charge : en mode Streamer, les
+curseurs règlent toujours le mix Classic.
 
-Le workflow [`.github/workflows/build.yml`](.github/workflows/build.yml) compile l'UI
-(Bun) puis le binaire Windows (Go, cross-compilé depuis Linux, CGO désactivé) à chaque
-push / PR. Le `sonar-remote.exe` est disponible en **artifact** de chaque run.
-
-Pour publier une **release** avec le binaire, pousse un tag de version :
-
-```bash
-git tag v1.0.0 && git push origin v1.0.0
-```
-
-## Développement
-
-```powershell
-# Terminal 1 : backend (proxy + API) sur 8080
-go run . --port 8080
-# Terminal 2 : UI en hot-reload (proxy /api → :8080)
-cd web ; bun run dev
-```
-
-## API
-
-Le reverse de l'API Sonar utilisé est documenté dans [`openapi.yaml`](openapi.yaml).
-Le proxy expose ces routes sous le préfixe `/api` (ex. `PUT /api/volumeSettings/classic/game/Volume/0.5`).
+La télécommande web n'a pas d'authentification : tout appareil du réseau local
+peut régler le volume. Si tu ne t'en sers pas, refuse l'accès réseau quand le
+pare-feu Windows le demande : le mixer de bureau n'en a pas besoin.

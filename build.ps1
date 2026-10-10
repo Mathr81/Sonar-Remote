@@ -1,18 +1,17 @@
-# Builds the Svelte UI, embeds it, and produces sonar-remote.exe
+# Builds the web remote, embeds it, and produces sonar-remote.exe.
 $ErrorActionPreference = "Stop"
-$root = $PSScriptRoot
 
-Write-Host "==> Building web UI (Vite/Svelte)..." -ForegroundColor Cyan
-Push-Location (Join-Path $root "web")
-if (-not (Test-Path "node_modules")) { bun install }
-bun run build
-Pop-Location
+Push-Location (Join-Path $PSScriptRoot "web")
+try {
+    bun install --frozen-lockfile
+    bun run build
+} finally { Pop-Location }
 
-Write-Host "==> Building Go binary..." -ForegroundColor Cyan
-Push-Location $root
-# -ldflags "-H windowsgui" would hide the console; keep it visible for logs.
-$env:CGO_ENABLED = "0"
-go build -ldflags "-s -w" -o sonar-remote.exe .
-Pop-Location
+Push-Location $PSScriptRoot
+try {
+    $env:CGO_ENABLED = "0"
+    # -H=windowsgui: no console window. Drop it (or use `go run .`) to see logs.
+    go build -ldflags "-s -w -H=windowsgui" -o sonar-remote.exe .
+} finally { Pop-Location }
 
-Write-Host "==> Done: $(Join-Path $root 'sonar-remote.exe')" -ForegroundColor Green
+Write-Host "Built $(Join-Path $PSScriptRoot 'sonar-remote.exe')" -ForegroundColor Green

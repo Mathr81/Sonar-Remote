@@ -8,47 +8,34 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # needed to attach the binary to a release on tag pushes
+  contents: write # attach the binary to a release on tag pushes
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest # the tray code and its tests are Windows-only
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Build the Svelte UI into web/dist (embedded by the Go binary).
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+      - uses: oven-sh/setup-bun@v2
 
-      - name: Build web UI
-        working-directory: web
-        run: |
-          bun install --frozen-lockfile
-          bun run build
-
-      # 2. Cross-compile the Windows binary (pure Go, CGO off).
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
-      - name: Build sonar-remote.exe
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: "0"
-        run: go build -ldflags "-s -w" -o sonar-remote.exe .
+      - name: Build
+        run: ./build.ps1
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Test
+        run: |
+          go vet ./...
+          go test ./...
+
+      - uses: actions/upload-artifact@v4
         with:
           name: sonar-remote
           path: sonar-remote.exe
           if-no-files-found: error
 
-      # 3. On a version tag (e.g. v1.0.0), publish a Release with the binary.
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
